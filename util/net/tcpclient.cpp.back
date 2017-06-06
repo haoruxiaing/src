@@ -1,0 +1,225 @@
+#include "tcpclient.h"
+
+const int TcpClient::kMaxRetryDelayMilliseconds;
+
+TcpClient::TcpClient(const SocketAddress& address, EventLoop* loop) 
+    : loop_(loop)
+    , socket_()
+    , thread_(0)
+    , address_(address)
+    , stop_(false)
+    , connect_(false)
+    , retry_(false) 
+    , connect_callback_(0)
+    , read_callback_(0)
+    , delay_timeout_(0)
+    , retry_delay_(kInitRetryDelayMilliseconds)
+    , read_timeout_(-1) {}
+
+TcpClient::~TcpClient() {
+    if (thread_ && thread_->joinable()) {
+        thread_->join();
+
+        delete loop_;
+    }
+
+    if (socket_) delete socket_;
+}
+
+void TcpClient::Connect() {
+    if (loop_) {
+        loop_->RunInEventLoopThread(
+            std::bind(&TcpClient::RealConnect, this));
+    } else {
+        loop_ = new EventLoop();
+        thread_.reset(new std::thread(&TcpClient::ThreadLoop, this));
+    }
+    delay_timeout_.reset(new DelayTimeout(this, loop_));
+}
+
+void TcpClient::Disconnect() {
+    connect_ = false;
+
+    if (!socket_)
+        return;
+
+    if (loop_->IsInEventLoopThread()) {
+        socket_->Close();
+    } else {
+        loop_->RunInEventLoopThread(
+            std::bind(&AsyncSocket::Close, socket_));
+    }
+}
+
+void TcpClient::Stop() {
+    stop_ = true;
+    if (connect_) {
+        if (loop_->IsInEventLoopThread()) {
+            socket_->SetReadCB(0);
+            socket_->Close();
+        } else {
+            loop_->RunInEventLoopThread(
+                std::bind(&AsyncSocket::SetReadCB, socket_, 0));
+            loop_->RunInEventLoopThread(
+                std::bind(&AsyncSocket::Close, socket_));
+        }
+
+        connect_callback_ = 0;
+        read_callback_ = 0;
+    }
+
+    if (thread_) {
+        loop_->TerminateLoopSoon();
+    }
+}
+
+void TcpClient::Send(const char* data, size_t len) {
+    Send(std::string(data, len));
+}
+
+void TcpClient::Send(const std::string& message) {
+    if (!connect_ || !socket_ || !socket_->connected()) {
+        //LOG(ERROR) << "disconnected, discard this message";
+        return ;
+    }
+
+    //last_rw_time_ = std::chrono::steady_clock::now();
+    if (loop_->IsInEventLoopThread()) {
+        socket_->Write(message);
+    } else {
+        loop_->RunInEventLoopThread(
+            std::bind(&TcpClient::SendInLoop, this, message));
+    }
+}
+
+void TcpClient::ConnectSuccess()  {
+    //LOG(INFO) << "connect to " << address_.ToIpPort() << " success";
+    connect_ = true;
+    socket_->SetReadCB(this);
+    if (read_timeout_ > 0) {
+        socket_->ScheduleReadTimeout(read_timeout_ / 2);
+    }
+    // reset @retry_delay_
+    retry_delay_ = kInitRetryDelayMilliseconds;
+
+    if (connect_callback_) 
+        connect_callback_->ConnectSuccess();
+}
+
+void TcpClient::ConnectErr() {
+    LOG(ERROR) << "connect to " << address_.ToIpPort() << " error";
+    connect_ = false;
+
+    if (connect_callback_) {
+        connect_callback_->ConnectErr();
+    }
+    socket_->Close();
+
+    if (retry_) {
+        DelayConnect();
+    }
+}
+
+void TcpClient::ReadDataAvailable(Buffer* message) {
+    //VLOG(8) << "receive " << message->ReadableBytes() << " bytes message";
+
+    //last_rw_time_ = std::chrono::steady_clock::now();
+    if (read_callback_) {
+        read_callback_->ReadDataAvailable(message);
+    } else {
+        LOG(WARNING) << "read_callback_ isn't set, discart this message";
+        message->RetrieveAll();
+    }
+}
+
+void TcpClient::ReadErr(int err)  {
+    LOG(WARNING) << "read error:" << err;
+    connect_ = false;
+    if (read_callback_) {
+        read_callback_->ReadEOF();
+    }
+    socket_->CancelReadTimeout();
+    socket_->Close();
+
+    if (retry_) {
+        DelayConnect();
+    }
+}
+
+void TcpClient::ReadEOF()  {
+    //LOG(WARNING) << "disconnected with " << address_.ToIpPort();
+    connect_ = false;
+    if (read_callback_) {
+        read_callback_->ReadEOF();
+    }
+    socket_->CancelReadTimeout();
+    socket_->Close();
+
+    if (retry_) {
+        DelayConnect();
+    }
+}
+
+void TcpClient::ReadTimeout() {
+    /* using namespace std::chrono;
+    auto now = steady_clock::now();
+    auto tp = duration_cast<milliseconds>(now - last_rw_time_);
+    if (tp.count() >= read_timeout_) {
+        Disconnect();
+    } else {
+        socket_->ScheduleReadTimeout(read_timeout_ / 2);
+    }*/
+}
+
+void TcpClient::ThreadLoop() {
+    sigset_t ss;
+    sigemptyset(&ss);
+    sigaddset(&ss, SIGHUP);
+    sigaddset(&ss, SIGINT);
+    sigaddset(&ss, SIGQUIT);
+    sigaddset(&ss, SIGUSR1);
+    sigaddset(&ss, SIGUSR2);
+    sigaddset(&ss, SIGPIPE);
+    sigaddset(&ss, SIGALRM);
+    sigaddset(&ss, SIGTERM);
+    sigaddset(&ss, SIGCHLD);
+    sigaddset(&ss, SIGIO);
+    PCHECK(pthread_sigmask(SIG_BLOCK, &ss, 0) == 0);
+    
+    RealConnect();
+    while (!stop_) {
+        loop_->Loop();
+    }
+}
+
+void TcpClient::SendInLoop(const std::string& message) {
+    assert(loop_->IsInEventLoopThread());
+    if (socket_ && socket_->connected()) {
+        socket_->Write(message);
+    }
+}
+
+void TcpClient::DelayConnect() {
+/*    LOG(INFO) << "retry connecting to " << address_.ToIpPort() << " in " 
+              << retry_delay_ << " milliseconds";*/
+    delay_timeout_->ScheduleTimeout(retry_delay_);
+    retry_delay_ = std::min(retry_delay_ * 2, kMaxRetryDelayMilliseconds);
+}
+
+void TcpClient::RealConnect() {
+    // 5s连接超时
+    //socket_.reset(new AsyncSocket(loop_, address_, 5000));
+    if (socket_) {
+      delete socket_;
+      socket_ = 0;
+    }
+    socket_ = new AsyncSocket(loop_, address_, 5000);
+    socket_->SetConnectCB(this);
+    //socket_->SetReadCB(this);
+}
+
+void TcpClient::Reconnect() {
+/*    LOG(INFO) << "reconnect to " << address_.ToIpPort();*/
+    RealConnect();
+}
+

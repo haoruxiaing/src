@@ -1,0 +1,153 @@
+#ifndef NET_TCPCLIENT_H
+#define NET_TCPCLIENT_H
+
+#include <thread>
+#include <memory>
+#include <chrono>
+
+#include "async_socket.h"
+#include "event_loop.h"
+#include "socket_address.h"
+#include "buffer.h"
+
+class TcpClient : public AsyncSocket::ConnectCallback,
+                  public AsyncSocket::ReadCallback {
+ public:
+    
+  // 连接回调定义
+  class ConnectCallback {
+   public:
+    virtual ~ConnectCallback() {}
+
+    // 连接成功回调此函数
+    virtual void ConnectSuccess() = 0;
+
+    // 连接错误回调此函数
+    virtual void ConnectErr()  = 0;
+  };
+
+  // 消息可读回调定义
+  class ReadCallback {
+   public:
+    virtual ~ReadCallback() {}
+
+    // 消息可读
+    virtual void ReadDataAvailable(Buffer* message)  = 0;
+
+    // 连接断开
+    virtual void ReadEOF()  = 0;
+  };
+
+  TcpClient(const SocketAddress& address, EventLoop* loop = 0);
+  virtual ~TcpClient();
+
+  void Connect();
+  void Disconnect();
+  void Stop();
+
+  void Send(const char* data, size_t len);
+  void Send(const std::string& message);
+
+  bool retry() const {
+      return retry_;
+  }
+  
+  // 打开自动重连
+  void EnableRetry() {
+      retry_ = true;
+  }
+  
+  // 关闭自动重连
+  void DisableRetry() {
+      retry_ = false;
+  }
+
+  void SetConnectCB(ConnectCallback* callback) {
+      connect_callback_ = callback;
+  }
+
+  void SetReadCB(ReadCallback* callback) {
+      read_callback_ = callback;
+  }
+
+  void SetEventLoop(EventLoop* loop) {
+      loop_ = loop;
+  }
+
+  void SetReadTimeout(int timeout) {
+      read_timeout_ = timeout;
+  }
+
+  EventLoop* GetEventLoop() {
+      return loop_;
+  }
+
+  void ScheduleReadTimeout(int timeout) {
+      if (timeout > 0) {
+          read_timeout_ = timeout;
+          if (socket_) {
+              socket_->ScheduleReadTimeout(timeout);
+          }
+      }
+  }
+
+  void CancelReadTimeout() {
+      if (socket_) {
+          socket_->CancelReadTimeout();
+      }
+  }
+
+  virtual void ConnectSuccess() ;
+  virtual void ConnectErr() ;
+
+  virtual void ReadDataAvailable(Buffer* message) ;
+  virtual void ReadErr(int err) ;
+  virtual void ReadEOF() ;
+  virtual void ReadTimeout() ;
+
+
+ private:
+  static const int kMaxRetryDelayMilliseconds = 30 * 1000;
+  static const int kInitRetryDelayMilliseconds = 500;
+
+  // 超时重连
+  class DelayTimeout : public AsyncTimeout {
+   public:
+    DelayTimeout(TcpClient* client, EventLoop* loop)
+        : AsyncTimeout(loop) 
+        , client_(client) {}
+    virtual ~DelayTimeout() {}
+
+    virtual void TimeoutExpired()  {
+        client_->Reconnect();
+    }
+   private:
+    TcpClient* client_;
+  };
+
+  void ThreadLoop();
+
+  void SendInLoop(const std::string& message);
+
+  void DelayConnect();
+  void RealConnect();
+  void Reconnect();
+
+  EventLoop* loop_;
+  //std::shared_ptr<AsyncSocket> socket_;
+  AsyncSocket* socket_;
+  std::unique_ptr<std::thread> thread_;
+  SocketAddress address_;
+  bool stop_;
+  bool connect_;
+  bool retry_;
+  ConnectCallback* connect_callback_;
+  ReadCallback* read_callback_;
+  std::unique_ptr<DelayTimeout> delay_timeout_;
+  int retry_delay_;
+  // 读写超时时间(ms)
+  int read_timeout_;
+  //std::chrono::steady_clock::time_point last_rw_time_;
+};
+
+#endif
